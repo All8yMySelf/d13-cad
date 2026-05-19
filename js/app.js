@@ -1,6 +1,65 @@
 
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+// ─── Inline OrbitControls (simplified) ───
+const OrbitControls = function(camera, domElement) {
+  this.camera = camera;
+  this.domElement = domElement;
+  this.target = new THREE.Vector3();
+  this.enableDamping = true;
+  this.dampingFactor = 0.08;
+  this.maxPolarAngle = Math.PI / 2 + 0.1;
+  this.minDistance = 20;
+  this.maxDistance = 600;
+
+  let isDragging = false, rotateStart = { x:0, y:0 };
+  let spherical = new THREE.Spherical(), sphericalDelta = new THREE.Spherical();
+
+  const scope = this;
+  const onMouseDown = e => {
+    isDragging = true;
+    rotateStart.x = e.clientX;
+    rotateStart.y = e.clientY;
+  };
+  const onMouseMove = e => {
+    if (!isDragging) return;
+    const dx = e.clientX - rotateStart.x;
+    const dy = e.clientY - rotateStart.y;
+    sphericalDelta.theta -= dx * 0.005;
+    sphericalDelta.phi -= dy * 0.005;
+    rotateStart.x = e.clientX;
+    rotateStart.y = e.clientY;
+    update();
+  };
+  const onMouseUp = () => { isDragging = false; };
+  const onWheel = e => {
+    const dist = camera.position.distanceTo(scope.target);
+    const newDist = Math.max(scope.minDistance, Math.min(scope.maxDistance, dist + e.deltaY * 0.1));
+    const dir = camera.position.clone().sub(scope.target).normalize();
+    camera.position.copy(scope.target).add(dir.multiplyScalar(newDist));
+  };
+
+  domElement.addEventListener('mousedown', onMouseDown);
+  domElement.addEventListener('mousemove', onMouseMove);
+  domElement.addEventListener('mouseup', onMouseUp);
+  domElement.addEventListener('wheel', onWheel, { passive: true });
+
+  function update() {
+    const offset = camera.position.clone().sub(scope.target);
+    spherical.setFromVector3(offset);
+    spherical.theta += sphericalDelta.theta;
+    spherical.phi += sphericalDelta.phi;
+    spherical.phi = Math.max(0.1, Math.min(scope.maxPolarAngle, spherical.phi));
+    spherical.makeSafe();
+    offset.setFromSpherical(spherical);
+    camera.position.copy(scope.target).add(offset);
+    camera.lookAt(scope.target);
+    sphericalDelta.set(0, 0, 0);
+  }
+
+  this.update = update;
+};
+
+// ─── App Code ───
+
 
 // ═══════════════════════════════════════════════════════════════
 //  D13-CAD  —  Main Application
@@ -494,6 +553,10 @@ function createObject(shapeKey, position = new THREE.Vector3(0, 10, 0)) {
   if (!def) return null;
 
   const geo = def.make();
+  // Backup original positions for vertex deformation
+  const posArr = geo.attributes.position;
+  geo.userData.originalPositions = new Float32Array(posArr.array);
+
   const mat = new THREE.MeshStandardMaterial({
     color: def.color,
     roughness: 0.4,
@@ -511,7 +574,7 @@ function createObject(shapeKey, position = new THREE.Vector3(0, 10, 0)) {
     shapeName: def.name,
     originalParams: { ...def.params },
     isDummy13: def.category === 'dummy13',
-    vertices: [],   // will store editable vertex handles
+    vertices: [],
   };
 
   STATE.scene.add(mesh);
@@ -570,13 +633,11 @@ function selectObject(mesh) {
   wfMesh.userData.isSelection = true;
   mesh.add(wfMesh);
 
-  // Transform gizmo (simple arrow helpers)
+  // Transform gizmo
   addTransformGizmo(mesh);
 
-  // Vertex handles for D13 pieces
-  if (mesh.userData.isDummy13 || true) {
-    addVertexHandles(mesh);
-  }
+  // Vertex handles for ALL objects (allow reshaping everything)
+  addVertexHandles(mesh);
 
   updatePropertiesPanel();
 }
@@ -609,6 +670,8 @@ function addTransformGizmo(mesh) {
 }
 
 function addVertexHandles(mesh) {
+  // Clear old handles first
+  mesh.userData.vertices = [];
   const geo = mesh.geometry;
   const posAttr = geo.attributes.position;
   const worldPos = new THREE.Vector3();
@@ -619,16 +682,11 @@ function addVertexHandles(mesh) {
 
   for (let i = 0; i < posAttr.count; i += step) {
     const vx = posAttr.getX(i), vy = posAttr.getY(i), vz = posAttr.getZ(i);
-    worldPos.set(vx, vy, vz).applyMatrix4(mesh.matrixWorld);
 
-    // Convert back to local for the handle
-    const localPos = worldPos.clone();
-    mesh.worldToLocal(localPos);
-
-    const dotGeo = new THREE.SphereGeometry(1.2, 8, 8);
-    const dotMat = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+    const dotGeo = new THREE.SphereGeometry(1.5, 8, 8);
+    const dotMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.85 });
     const dot = new THREE.Mesh(dotGeo, dotMat);
-    dot.position.copy(localPos);
+    dot.position.set(vx, vy, vz);
     dot.userData.isVertex = true;
     dot.userData.vertexIndex = i;
     mesh.add(dot);
@@ -700,7 +758,8 @@ function onMouseMove(e) {
     const hit = STATE.raycaster.intersectObject(ground)[0];
     if (hit) {
       const worldTarget = hit.point.clone();
-      // Convert to local space
+      // Convert to local space of the parent mesh
+      parent.updateMatrixWorld();
       const localTarget = worldTarget.clone();
       parent.worldToLocal(localTarget);
 
@@ -710,10 +769,10 @@ function onMouseMove(e) {
       localTarget.y = Math.round(localTarget.y / snap) * snap;
       localTarget.z = Math.round(localTarget.z / snap) * snap;
 
-      // Move the vertex handle
+      // Move the visual handle
       STATE.draggedVertex.position.copy(localTarget);
 
-      // Deform the actual geometry!
+      // Deform the actual geometry
       deformMeshAtVertex(parent, STATE.draggedVertex.userData.vertexIndex, localTarget);
 
       // Update selection box
@@ -776,28 +835,35 @@ function deformMeshAtVertex(mesh, vertexIndex, newLocalPos) {
   const geo = mesh.geometry;
   const posAttr = geo.attributes.position;
 
-  // Direct move — shift the vertex
-  posAttr.setXYZ(vertexIndex, newLocalPos.x, newLocalPos.y, newLocalPos.z);
-
-  // Affect neighbours for smooth organic deformation (for D13 pieces)
+  // Get the original position of this vertex
   const origPos = geo.userData.originalPositions;
-  if (origPos) {
-    const ox = origPos[vertexIndex * 3];
-    const oy = origPos[vertexIndex * 3 + 1];
-    const oz = origPos[vertexIndex * 3 + 2];
-    const dx = newLocalPos.x - ox;
-    const dy = newLocalPos.y - oy;
-    const dz = newLocalPos.z - oz;
+  if (!origPos) {
+    // Fallback: just move the single vertex
+    posAttr.setXYZ(vertexIndex, newLocalPos.x, newLocalPos.y, newLocalPos.z);
+    posAttr.needsUpdate = true;
+    geo.computeVertexNormals();
+    return;
+  }
 
-    const radius = 12; // influence radius in mm
-    for (let i = 0; i < posAttr.count; i++) {
-      if (i === vertexIndex) continue;
-      const ix = origPos[i * 3], iy = origPos[i * 3 + 1], iz = origPos[i * 3 + 2];
-      const dist = Math.sqrt((ix-ox)**2 + (iy-oy)**2 + (iz-oz)**2);
-      if (dist < radius) {
-        const falloff = (1 - dist/radius) ** 2;
-        posAttr.setXYZ(i, ix + dx*falloff, iy + dy*falloff, iz + dz*falloff);
-      }
+  const ox = origPos[vertexIndex * 3];
+  const oy = origPos[vertexIndex * 3 + 1];
+  const oz = origPos[vertexIndex * 3 + 2];
+  const dx = newLocalPos.x - ox;
+  const dy = newLocalPos.y - oy;
+  const dz = newLocalPos.z - oz;
+
+  // Influence radius based on object size
+  const box = new THREE.Box3().setFromObject(mesh);
+  const bSize = new THREE.Vector3();
+  box.getSize(bSize);
+  const radius = Math.max(bSize.x, bSize.y, bSize.z) * 0.35;
+
+  for (let i = 0; i < posAttr.count; i++) {
+    const ix = origPos[i * 3], iy = origPos[i * 3 + 1], iz = origPos[i * 3 + 2];
+    const dist = Math.sqrt((ix-ox)**2 + (iy-oy)**2 + (iz-oz)**2);
+    if (dist < radius) {
+      const falloff = (1 - dist/radius) ** 2;
+      posAttr.setXYZ(i, ix + dx*falloff, iy + dy*falloff, iz + dz*falloff);
     }
   }
 
@@ -1166,13 +1232,7 @@ function init() {
   buildShapePalette('basic');
   buildColorPresets();
 
-  // Store original positions for deformation reference
-  setTimeout(() => {
-    STATE.objects.forEach(o => {
-      const pos = o.geometry.attributes.position;
-      o.geometry.userData.originalPositions = new Float32Array(pos.array);
-    });
-  }, 500);
+  // Objects already have originalPositions from createObject
 
   // Hide loading
   setTimeout(() => {
